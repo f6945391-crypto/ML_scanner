@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<!--
+  dashboard.html — Monitor en vivo del AE-IDS. AUDITADO 2026-07-05 (ver INFORME_AUDITORIA_FABLE.md).
+
+  Cambios de auditoría (C3/C4/§4a/§4b) — formato tomado de las figuras Kaggle
+  (fig_paper_scatter.png / fig_dist_roc_pr.png), que son la referencia visual del proyecto:
+    1. Score por muestra como SCATTER con eje Y LOGARÍTMICO (antes: línea, lineal, beginAtZero
+       → los scores normales ~0.4–1.8 se aplastaban contra 0 como "rayas" frente a ataques 63–1501).
+       Puntos: normal azul, anomalía naranja; umbral τ en línea roja (igual que la figura del paper).
+    2. Panel HISTOGRAMA de log10(score) normal vs anomalía + τ (análogo a Figs. 3-4 del paper).
+    3. Panel THROUGHPUT por cliente (§4b): pkts/s por src_ip en ventanas de 5 s — muestra la
+       atenuación del cliente normal durante el ataque. Requiere que el evento SSE traiga
+       `src_ip` y `pkts_per_s` (ver service_flask.py y db_schema.sql auditados).
+    4. maxPoints 200 → 800.
+  Rendimiento en tiempo real (causa probable de los problemas de visualización reportados):
+    - update('none') en cada push (sin animación ni re-layout);
+    - el histograma se refresca cada 10 eventos y el panel de throughput en un setInterval de
+      1 s desacoplado del SSE (un flood de /predict ya no fuerza un re-render por paquete);
+    - el log de eventos se poda a 300 filas (antes crecía sin límite y degradaba el DOM);
+    - los datasets usan ventana deslizante (shift) acotada por maxPoints.
+  Campos SSE nuevos (src_ip, pkts_per_s) son OPCIONALES: sin ellos, los paneles 1-2 funcionan
+  igual y el panel 3 muestra un aviso. No rompe el contrato SSE existente.
+-->
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>IoT AE-IDS — Monitor en vivo</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; background:#0f1420; color:#e6e6e6; }
+    h1 { font-size: 20px; } h3 { margin: 18px 0 6px; font-size: 14px; color:#aab; }
+    .stats { display:flex; gap:24px; margin:12px 0; flex-wrap:wrap; }
+    .card { background:#1a2030; padding:12px 16px; border-radius:8px; min-width:120px; }
+    .card .n { font-size:24px; font-weight:700; }
+    .anom { color:#ff5a5a; } .norm { color:#5aa0ff; }
+    .row { display:flex; gap:16px; flex-wrap:wrap; }
+    .panel { flex:1 1 460px; background:#131a28; border-radius:8px; padding:10px; }
+    #log { height:140px; overflow:auto; background:#11151f; padding:8px; border-radius:8px;
+           font-family: monospace; font-size:12px; }
+    .hint { font-size:11px; color:#778; }
+  </style>
+</head>
+<body>
+  <h1>IoT AE-IDS — error de reconstrucción en tiempo real</h1>
+  <div class="stats">
+    <div class="card">flujos <div class="n" id="total">0</div></div>
+    <div class="card">anomalías <div class="n anom" id="anoms">0</div></div>
+    <div class="card">umbral τ <div class="n" id="tau">{{ threshold }}</div></div>
+    <div class="card">último score <div class="n" id="last">–</div></div>
+    <div class="card">% anómalo (últ. 100) <div class="n" id="rate">–</div></div>
+  </div>
+
+  <div class="row">
+    <div class="panel">
+      <h3>Score por flujo vs umbral — escala log (estilo figura del paper)</h3>
+      <canvas id="chartScore" height="110"></canvas>
+    </div>
+    <div class="panel">
+      <h3>Distribución de log10(score) — normal vs anomalía</h3>
+      <canvas id="chartHist" height="110"></canvas>
+    </div>
+  </div>
+  <div class="row">
+    <div class="panel">
+      <h3>Throughput por cliente (pkts/s, ventanas de 5 s) — atacante vs cliente normal</h3>
+      <canvas id="chartTput" height="90"></canvas>
+      <div class="hint" id="tputHint">Esperando eventos con src_ip/pkts_per_s…
+        (la atenuación del cliente normal durante el ataque se ve como caída de su serie)</div>
+    </div>
+  </div>
+
+  <h3>Eventos</h3>
+  <div id="log"></div>
+
+  <script>
+    const tau = Number("{{ threshold }}") || 0;
+    let total = 0, anoms = 0;
+    const maxPoints = 800;                        // C4: antes 200 (muy corto)
+    const recent = [];                            // ventana deslizante para % anómalo
+    const AZUL = '#5aa0ff', NARANJA = '#ffa040', ROJO = '#ff5a5a';
+
+    // ---------- Panel 1: scatter con Y log (formato fig_paper_scatter) ----------
+    let n = 0;
+    const chartScore = new Chart(document.getElementById('chartScore'), {
+      type: 'scatter',
+      data: { datasets: [
+        { label: 'normal',   data: [], backgroundColor: AZUL,    pointRadius: 2.5 },
+        { label: 'anomalía', data: [], backgroundColor: NARANJA, pointRadius: 2.5 },
+        { label: 'umbral τ', data: [], type: 'line', borderColor: ROJO, borderWidth: 1.6,
+          pointRadius: 0 }
+      ]},
+      options: { animation: false,
+        scales: {
+          x: { type: 'linear', title: { display: true, text: 'flujo #' }, ticks: { color:'#889' } },
+          y: { type: 'logarithmic', title: { display: true, text: 'RE (mse, escala log)' },
+               ticks: { color:'#889' } }          // C3: log; sin beginAtZero (imposible en log)
+        },
+        plugins: { legend: { labels: { color: '#ccc' } } } }
+    });
+
+    // ---------- Panel 2: histograma de log10(score) ----------
+    const NBINS = 36, HMIN = -1.5, HMAX = 5;      // rango log10 esperado: 0.03 … 100 000
+    const centers = Array.from({length: NBINS},
+        (_, i) => (HMIN + (i + 0.5) * (HMAX - HMIN) / NBINS).toFixed(2));
+    const histN = new Array(NBINS).fill(0), histA = new Array(NBINS).fill(0);
+    const binOf = v => Math.max(0, Math.min(NBINS - 1,
+        Math.floor((Math.log10(Math.max(v, 1e-6)) - HMIN) / (HMAX - HMIN) * NBINS)));
+    const chartHist = new Chart(document.getElementById('chartHist'), {
+      type: 'bar',
+      data: { labels: centers, datasets: [
+        { label: 'normal',   data: histN, backgroundColor: AZUL + '99' },
+        { label: 'anomalía', data: histA, backgroundColor: NARANJA + '99' }
+      ]},
+      options: { animation: false,
+        scales: { x: { stacked: true, title: { display: true, text: 'log10(score)' },
+                       ticks: { color:'#889', maxTicksLimit: 8 } },
+                  y: { title: { display: true, text: 'flujos' }, ticks: { color:'#889' } } },
+        plugins: { legend: { labels: { color: '#ccc' } },
+                   title: { display: true, color: '#f88',
+                            text: 'τ = ' + tau.toFixed(3) +
+                                  '  (log10 τ = ' + Math.log10(Math.max(tau,1e-6)).toFixed(2) + ')' } } }
+    });
+
+    // ---------- Panel 3: throughput por cliente (§4b) ----------
+    const WIN_S = 5, MAXW = 120;                  // 120 ventanas de 5 s = 10 min visibles
+    const tput = new Map();                       // src_ip -> Map(ventana -> Σ pkts_per_s)
+    let tputDirty = false;
+    const chartTput = new Chart(document.getElementById('chartTput'), {
+      type: 'line',
+      data: { labels: [], datasets: [] },
+      options: { animation: false,
+        scales: { x: { ticks: { color:'#889', maxTicksLimit: 10 } },
+                  y: { type: 'logarithmic', title: { display: true, text: 'pkts/s (log)' },
+                       ticks: { color:'#889' } } },
+        plugins: { legend: { labels: { color: '#ccc' } } } }
+    });
+    const PALETA = [AZUL, NARANJA, '#5affa0', '#ff5a5a', '#c58aff', '#ffd75a'];
+
+    function addTput(ev) {
+      if (!ev.src_ip || ev.pkts_per_s == null) return;
+      const w = Math.floor(ev.ts / WIN_S) * WIN_S;
+      if (!tput.has(ev.src_ip)) tput.set(ev.src_ip, new Map());
+      const serie = tput.get(ev.src_ip);
+      serie.set(w, (serie.get(w) || 0) + Number(ev.pkts_per_s));
+      tputDirty = true;
+      document.getElementById('tputHint').textContent =
+        'Serie por src_ip: durante el ataque la curva del atacante sube y la del cliente normal cae (atenuación).';
+    }
+    function redrawTput() {                       // desacoplado del SSE: 1 render/s como máximo
+      if (!tputDirty) return; tputDirty = false;
+      const wins = [...new Set([...tput.values()].flatMap(m => [...m.keys()]))].sort().slice(-MAXW);
+      chartTput.data.labels = wins.map(w => new Date(w * 1000).toLocaleTimeString());
+      chartTput.data.datasets = [...tput.entries()].map(([ip, m], i) => ({
+        label: ip, data: wins.map(w => m.get(w) ?? null), borderColor: PALETA[i % PALETA.length],
+        pointRadius: 0, tension: .2, spanGaps: true }));
+      chartTput.update('none');
+    }
+    setInterval(redrawTput, 1000);
+
+    // ---------- SSE ----------
+    function push(ev) {
+      total++; if (ev.anomaly) anoms++;
+      recent.push(ev.anomaly ? 1 : 0); if (recent.length > 100) recent.shift();
+      document.getElementById('total').textContent = total;
+      document.getElementById('anoms').textContent = anoms;
+      document.getElementById('last').textContent = ev.score.toFixed(4);
+      document.getElementById('rate').textContent =
+        (100 * recent.reduce((a, b) => a + b, 0) / recent.length).toFixed(0) + '%';
+
+      // Panel 1 (ventana deslizante acotada; sin animación)
+      n++;
+      const ds = chartScore.data.datasets;
+      (ev.anomaly ? ds[1] : ds[0]).data.push({ x: n, y: Math.max(ev.score, 1e-6) });
+      ds[2].data.push({ x: n, y: ev.threshold ?? tau });
+      for (const d of ds) while (d.data.length > maxPoints) d.data.shift();
+      chartScore.options.scales.x.min = Math.max(0, n - maxPoints);
+      chartScore.update('none');
+
+      // Panel 2 (refresco cada 10 eventos: un flood no fuerza re-render por paquete)
+      (ev.anomaly ? histA : histN)[binOf(ev.score)]++;
+      if (total % 10 === 0) chartHist.update('none');
+
+      // Panel 3
+      addTput(ev);
+
+      // Log podado (antes crecía sin límite → DOM lento tras minutos de flood)
+      const t = new Date(ev.ts * 1000).toLocaleTimeString();
+      const log = document.getElementById('log');
+      const cls = ev.anomaly ? 'anom' : 'norm';
+      const fam = ev.attack_family ? ` [${ev.attack_family}]` : '';
+      const ip  = ev.src_ip ? ` ${ev.src_ip}` : '';
+      log.insertAdjacentHTML('afterbegin',
+        `<div class="${cls}">${t}${ip} score=${ev.score.toFixed(4)} ` +
+        `${ev.anomaly ? 'ANOMALÍA' : 'normal'}${fam}</div>`);
+      while (log.childElementCount > 300) log.removeChild(log.lastChild);
+    }
+
+    const es = new EventSource('/stream');
+    es.onmessage = (e) => push(JSON.parse(e.data));
+    es.onerror = () => console.warn('SSE desconectado, reintentando…');
+  </script>
+</body>
+</html>
